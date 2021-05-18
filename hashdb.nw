@@ -1,0 +1,931 @@
+\chapter{Элементарная база данных}
+
+В этой главе мы попробуем создать небольшую (в плане функциональности) базу данных, основанную на хеш-таблицах и заодно познакомимся с файловым вводом-выводом.
+База данных будет представлять собой персистентный (хранящийся на диске, переживающий выключение) ассоциативный массив ключ-значение, хранящийся в одном файле,
+где в качестве ключа и значения могу выступать строки произвольной длины.
+Приблизительно представляя, что такая база данных будет иметь интерфейс типа [[CRUD]] (от англ. названия четырех базовых операций Create-Retrieve-Update-Delete),
+попробуем, для начала, понять, как хеш-таблицу уложить в файл с возможностью изменения и дополнения.
+
+
+\section{Файловая грамматика}
+Даже бинарные данные, при упаковке в файл имеют иерархическую структуру.
+Эта структура описывается {\em грамматикой}. С грамматиками и синтаксисом мы уже знакомились в задаче про скобки.
+Грамматика, описывающая структуру хранения базы данных внутри файла имеет некоторые особенности, которые мы сейчас разберем.
+Итак, файл базы данных представляет собой заголовок и список таблиц (будем использовать способ расширения таблицы за счет добавления связанных таблиц большего размера).
+$$
+\begin{array}{llc}
+    \text{DB} & \gets & DHeader Table \\
+    DHeader & \gets & DMagic Version Stat \\
+    Table & \gets & THeader Node+ \\
+    THeader & \gets & TMagic Capacity Size Next\\
+    Node & \gets & KeyOff KeySz ValueOff ValueSz NextEl 
+\end{array}
+$$
+
+Начнем по порядку стоить структуру файла нашей БД. 
+$$
+    DB \gets  DHeader Table 
+$$
+Файл базы данных $DB$ начинается с заголовка $DHeader$, за которым сразу следует таблица $Table$.
+
+$$
+    DHeader \gets DMagic Version Stat \\
+$$
+Заголовок $DHeader$ будет содержать в себе некоторую "магическую" последовательность байт $DMagic$, которая будет указывать на тип файла, информацию о версии формата файла $Version$ -- пригодится нам в будущем, если формат будет меняться, а также статистику нашей БД $Stat$ для быстрой информации о том, сколько ключей хранится в базе, сколько таблиц создано, средний размер ключа, средний размер значений и т.д.
+
+Заголовку соответствует структура
+<<Структура заголовка БД>>=
+typedef struct _DHeader {
+    char magic[4];
+    uint32_t version;
+    struct _Stat stat;
+} DHeader;
+@
+
+Подробное внутреннее устройство статистики $Stat$ можно определить позже.
+
+$$
+    Table \gets THeader Node+
+$$
+Таблица $Table$ состоит из заголовка $THeader$ и массива элементов $Node$. Количество элементов, следующих за заголовком определяется в самом заголовке:
+$$
+    THeader \gets TMagic Capacity Size Next
+$$
+Заголовок таблицы $THeader$ cодержит в себе также "магическую" последовательность байт $TMagic$, которая будет говорить о том, что мы читаем именно нашу таблицу, Указание на общий размер таблицы $Capacity$, заполнение $Size$ и указатель на следующую таблицу.
+
+<<Структура заголовка таблицы>>=
+typedef struct _THeader {
+    char magic[4];
+    uint32_t capacity;
+    uint32_t size;
+    uint32_t nodes;
+    uint16_t len;
+    int64_t next;
+} THeader;
+@
+
+$$
+    Node \gets KeyOff KeySz ValueOff ValueSz Next
+$$
+Элемент содержит в себе информацию о расположении блока данных с ключом $KeyOff$ -- смещение внутри файла, $KeySz$  -- размер ключа и блока данных со значением (аналогично $ValueOff$, $ValueSz$ -- смещение и размер соответственно). Также, элемент содержит в себе ссылку  на следующий элемент $Next$ (смещение внутри файла) на случай коллизии.
+
+<<Структура элемента таблицы>>=
+typedef struct _Node {
+    int64_t keyoff;
+    uint64_t keysz;
+    int64_t valueoff;
+    uint64_t valuesz;
+    int64_t next;
+} Node;
+@
+
+Поскольку некоторые элементы могут быть незаполненными (пустыми), мы будем считать таковыми элементы с $KeyOff = 0$.
+
+\section{Описание работы}
+Работа нашей базы данных будет практически повторять работу обычной хеш-таблицы в памяти с тем исключением, данные будут храниться на диске, а следовательно, нам потребуется свой аналог функций [[malloc]] и [[free]], которые бы управляли выделением пространства для блоков данных в файле.
+
+Проще всего выделять память в конце файла. Обычно, все файловые системы оптимизированы по скорости добавления данных в конец файла. Поэтому каждый новый блок можно дописывать в конец файла, сохраняя его начальное смещение (которое будет равно размеру файла). Вот такой простой [[malloc]].  А [[free]] может вообще ничего не делать. Старые значения и ключи, которые больше не используются проще оставлять внутри файла. Так можно себе позволить поступать при перезаписи значений и ключей, которые могут иметь произвольные размеры, и перезаписать новое значение на старое место уже невозможно без повреждения соседних данных, или удаление элемента из односвязного списка -- старый элемент придется оставить на месте -- переиспользовать его уже мы вряд ли сможем. А вот перезаписывать блоки фиксированной длинны вполне возможно -- это касается заголовков БД, Таблиц, а также самих элементов.
+Да, конечно, файл при таком расточительном подходе на каждое изменение будет только расти, однако скорость записи в таком случае будет максимальной, поскольку мы не будем тратить время на то, чтобы подыскать свободное местечко для очередного блока внутри файла.
+Ведь существенную часть файла мы собираемся оставить на месте, а не перезаписывать.
+
+На случай, когда файл окажется слишком большим для реально хранимых значений (например, шла долгая история с перезаписями по одним и тем же ключам и файл будет копить в себе всю историю изменений, которая уже не может быть использована) лучше предусмотреть специальную процедуру "вакуумизации" -- перезаписи файла базы данных как-бы заново, оставляя только используемые блоки.
+
+Итак, рассмотрим добавление новой записи ключ-значение в нашу БД.
+Изначально, предполагаем, что файл БД содержит в себе только заголовок и таблицу c $Capacity=10$ (нижние индексы обозначают "версию" блоков)
+$$ 
+    DB_0 = DHeader_0(DMagic, Version, Stat_0), THeader_0(TMagic, 10, 0, 0), Node^0_0(0, 0, 0, 0, 0), \ldots, Node^9_0(0,0,0,0,0)
+$$
+Добавление пары ключ-значение должно повлиять на статистику $Stat$, $Size$ в $THeader$ и какой-то элемент, допустим $i$. Новые ключ-значение дописываются в конец файла:
+$$
+    DB_1 = DHeader_1(DMagic, Verison, Stat_1), THeader_1(TMagic, 10, 1, 0), Node^0_0(0,0,0,0,0), \ldots, Node^i_1([K_0], <K_0>, [V_0], <V_0>, 0), \ldots, K_0, V_0
+$$
+Здесь $[X]$ означает смещение блока $X$, а $<X>$ -- его размер. Последовательность модификации файла такова, что сначала дописываются в конец блоки с ключом и значением, их смещения запоминаются и записываютсяв в элемент $Node^i$, Обновляется заголовок таблицы $THeader$ и заголовок базы, поскольку изменяется статистика $Stat$.
+
+
+Если мы теперь захотим изменить значение по данному ключу $K_0$ на $V_1$, то файл перезапишется следующим образом:
+$$
+    DB_2 = DHeader_2(DMagic, Version, Stat_2), THeader_1(TMagic, 10, 1, 0), Node^0_0(0,0,0,0,0), \ldots, Node^i_2([K_0], <K_0>, [V_1], <V_1>, 0), \ldots, K_0, V_0, V_1
+$$
+
+Здесь происходит допись в конец только нового значения $V_1$ и обновление элемента $Node^i$ и всех заголовков.
+
+Рассмотрим теперь вариант поведения, когда происходит коллизия ключей при добавлении пары $K_2, V_2$.
+Коллизия ключей $K_0$ и $K_2$ на значении хеша $i$ должна приводить к добавлению элемента  в односвязный список, место для нового элемента $Node^{i'}$ также выделяется в конце файла:
+
+$$
+    DB_3 = DHeader_3(DMagic, Version, Stat_3), THeader_2(Magic, 10, 2, 0), Node^0_0(0,0,0,0,0), \ldots, Node^i_3([K_0], <K_0>, [V_1], <V_1>, [Node^{i'}]), \ldots, K_0, V_0, V_1, K_2, V_2, Node^{i'}_0([K_2], <K_2>, [V_2], <V_2>, 0)
+$$
+
+Как видим, тут тоже важна последовательность записи в файл, чтобы не делать несколько перезаписей.
+Сначала дописываются блоки с парой ключ-значение $K_2$, $V_2$, затем дописывается следующий элемент цепочки $Node^{i'}$, который ссылается на них, затем процесс повторяется для элемента таблицы и всех заголовков.
+
+
+
+Введем такое понятие как {\em курсор} -- это такая структура данных, которая сохраняет состояние поиска нужного элемента.
+Поскольку мы будем иметь несколько связанных таблиц, которые будем обходить последовательно, имеет смысл сохранять прочитанный заголовок текущей таблицы [[ht]], а заодно и его смещение внутри файла [[tableoff]], чтобы, в случае чего,  его обновить.
+Когда будем искать ключ в самой таблице, запомним также прочитанную структуру элемента [[node]] таблицы, его индекс [[idx]] в таблице и смещение [[nodeoff]], опять же, на случай модификации.
+Не будем также забывать, что потенциально элементы могут образовывать список и текущий элемент списка также было бы не плохо иметь под рукой, поскольку его придется модифицировать. Назовем эти поля [[chain]] и [[chainoff]] соответственно.
+
+<<Курсор>>=
+typedef struct _Cursor {
+    int fh;
+    Stat* stat;
+    THeader th;
+    off_t tableoff;
+    uint64_t hash;
+    uint64_t hash2;
+    int idx;
+    Node node;
+    off_t nodeoff;
+    Node chain;
+    off_t chainoff;
+    Node prev;
+    off_t prevoff;
+    int len;
+}Cursor;
+ // node    chain
+ // v        v
+ // N1->N3->N4->N5
+ // N2      
+ // N5->N6->N7->N8 <<< cursor 
+ // x
+@
+
+Теперь рассмотрим алгоритм "дописывания" в конец цепочки элементов нового элемента и пары ключ-значение.
+Будем предполагать, что мы уже встали на последний элемент цепочки и это состояние будет передано структуре [[Cursor]].
+Выделим некоторые "низкоуровневые" операции с файлов в виде функций с префиксом [[_file_]].
+Тогда алгоритм дописывания будет выглядеть следующим образом:
+
+<<Запись в цепочку>>=
+int _cur_write_chain(Cursor* cur, const char* key, const char* v) {
+    Node new = {0};
+    _file_append_block(cur->fh, key, &new.keyoff, &new.keysz);
+    _file_append_block(cur->fh, v, &new.valueoff, &new.valuesz);
+    _file_append_node(cur->fh, &new, &cur->chain.next);
+    _cur_update_chain(cur);
+    cur->th.size ++;
+    cur->len++;
+    _cur_update_table(cur);
+    cur->stat->keysz += new.keysz;
+    cur->stat->valuesz += new.valuesz;
+    cur->stat->keys ++;
+    if (cur->stat->maxlen < cur->len) cur->stat->maxlen = cur->len;
+    _cur_update_stat(cur);
+    return 0;
+}
+@
+Здесь мы используем предполагаемые низкоуровневые операции добавления блока и элемента в конец файла ([[_file_append_block]] и [[_file_append_node]] соответственно),
+А также высокоуровневые операции с курсором, которые позволяют на месте вносить изменения в файл. 
+Функция [[_cur_update_chain]] обновляет элемент [[chain]] курсора после обновления поля [[next]].
+Функция [[_cur_update_table]] обновляет заголовок текущей таблицы после внесения туда изменений, связанных со статистикой.
+Функция [[_cur_update_stat]] обновляет структуру со статистикой всей БД.
+
+
+Алгоритм записи в таблицу (безконфликтной) выглядит похожим образом, но обновляется табличный элемент [[node]], а не элемент цепочки [[chain]]:
+
+<<Запись в таблицу>>=
+int _cur_write_node(Cursor* cur, const char* key, const char* v) {
+    _file_append_block(cur->fh, key, &cur->node.keyoff, &cur->node.keysz);
+    _file_append_block(cur->fh, v, &cur->node.valueoff, &cur->node.valuesz);
+    _cur_update_node(cur);
+    cur->th.size ++;
+    cur->th.nodes ++;
+    _cur_update_table(cur);
+    cur->stat->keysz += cur->node.keysz;
+    cur->stat->valuesz += cur->node.valuesz;
+    cur->stat->keys ++;
+    cur->stat->nodes ++;
+    _cur_update_stat(cur);
+    return 0;
+}
+@
+
+Поскольку мы имеем дело с мутабельным ассоциативным массивом, значение [[v]], которое ассоциировано с ключом может быть изменено независимо от ключа.
+Опять же, предполагаем, что курсор стоит на нужном элементе.
+В этом случае мы только добавляем в конец файла блок с новым значением [[v]], обновляем элемент, чтобы он указывал на новый блок и  статистику:
+
+<<Обновление элемента>>=
+int _cur_set_value(Cursor* cur, const char* value) {
+    size_t oldsz = cur->chain.valuesz;
+    _file_append_block(cur->fh, value, &cur->chain.valueoff, &cur->chain.valuesz);
+    _cur_update_chain(cur);
+    cur->stat->valuesz += cur->chain.valuesz - oldsz;
+    _cur_update_stat(cur);
+}
+@
+
+Удаление из цепочки и удаление элемента из самой таблицы выглядят по-разному, это их можно объединить в одной функции.
+Если курсор находится на элементе внутри таблицы, у него смещения [[nodeoff]] и [[chainoff]] должны совпадать. 
+Физически удалить или забыть элемент в этом случае мы не можем, поэтому просто пометим его как удаленный при помощи указания нулевого смещения для заначения [[valueoff]].
+В противном случае, это просто удаление из односвязного списка.
+Аналогично, при этом, модифицируем статистику текущей таблицы и статистику БД.
+<<Удаление элемента>>=
+int _cur_del_node(Cursor* cur) {
+    if ( cur->nodeoff != cur->chainoff  ) {
+        cur->prev.next = cur->chain.next;
+        _cur_update_prev(cur);
+    } else {
+        cur->node.valueoff = 0;
+        _cur_update_node(cur);
+    }
+    cur->th.size --;
+    _cur_update_table(cur);
+    cur->stat->valuesz -= cur->node.valuesz;
+    cur->stat->keysz -= cur->node.keysz;
+    _cur_update_stat(cur);
+}
+@
+
+До этого мы предполагали, что курсор встал на нужную нам позицию для записи.
+Теперь посмотрим, как может происходить поиск элемента.
+Забегая вперед, можно сказать, что поиск может иметь две различных цели.
+Первая -- это чтение -- мы ищем элемент по ключу, чтобы прочитать его или удостовериться, что он есть. Если ключ не найден -- ничего в этом случае не делаем.
+Вторая цель -- это модификация, если элемент не найден, мы пытаемся найти место, чтобы записать новый. 
+При этом вполне может быть создана новая таблица, если предыдущая достигла критического значения фактора заполнения ($\approx 0.7$). 
+Цель поиска можно задать в самом курсоре, для этого предусмотрено поле [[mod]].
+
+Для начала опишем проход по цепочке:
+
+<<Проход по цепочке>>=
+int _cur_find(Cursor* cur, const char* key) {
+    if ( cur->chain.valueoff && _cur_cmp_chain(cur, key) ) return 1;
+    if ( cur->chain.next ) {
+        log("Reading next node at %ld\n", cur->chain.next);
+        _cur_read_chain(cur, cur->chain.next);
+        return _cur_find(cur, key);
+    }
+    return 0;
+}
+@
+Здесь мы пропускаем элементы c нулевым [[valueoff]]. Функция [[_cur_cmp_chain]] сравнивает побайтно ключ, а функция [[_cur_load_chain]] загружает поле [[chain]] курсора следующим элементом цепочки.
+
+Собственно, сам поиск элемента также является рекурсивной функцией обхода таблиц и перемещения на позицию с индексом, соответствующим хеш-функции.
+<<Поиск элемента>>=
+int _cur_search(Cursor* cur, const char* key) {
+    cur->idx = cur->hash % cur->th.capacity;
+    log("Searching for key %s at table %ld idx %u\n", key, cur->tableoff, cur->idx);
+    cur->nodeoff = cur->tableoff + sizeof(THeader) + sizeof(Node)*cur->idx;
+    _cur_load_node(cur);
+    cur->chainoff = cur->nodeoff;
+    cur->chain = cur->node;
+    if(_cur_find(cur, key)) 
+        return 1;
+    cur->idx = cur->hash2 % cur->th.capacity;
+    cur->nodeoff = cur->tableoff + sizeof(THeader) + sizeof(Node)*cur->idx;
+    _cur_load_node(cur);
+    cur->chainoff = cur->nodeoff;
+    cur->chain = cur->node;
+    if(_cur_find(cur, key))
+        return 1;
+    if ( cur->th.next ) {
+        _cur_read_table(cur, cur->th.next);
+        return _cur_search(cur, key);
+    }
+    return 0;
+}
+@
+Чтобы начать поиск, сначала вычислим значение хеш-функции, загрузим первую таблицу, инициализируем поля курсора и стартуем поиск.
+<<Инициализация курсора>>=
+int _ht_search(DB* db, Cursor* cur, const char* key) {
+    memset(cur, 0, sizeof(Cursor));
+    cur->stat = &db->stat;
+    cur->fh = db->fh;
+    cur->hash = db->hash(key);
+    cur->hash2 = db->hash2(key);
+    _cur_read_table(cur, (off_t)sizeof(DHeader));
+    return _cur_search(cur, key);
+}
+@
+
+
+<<Сравнение ключа>>=
+int _cur_cmp_chain(Cursor* cur, const char* key) {
+    size_t ks = strlen(key) + 1;
+    log("Comparing key '%s' with cursor\n", key);
+    if ( cur->chain.keysz != ks ) return 0;
+    log("Sizes %d are equal\n", ks);
+    lseek(cur->fh, cur->chain.keyoff, SEEK_SET);
+    return _file_cmp_block(cur->fh, key, ks);
+}
+@
+
+
+<<Загрузка элемента таблицы>>=
+int _cur_load_node(Cursor* cur) {
+    cur->len = 0;
+    lseek(cur->fh, cur->nodeoff, SEEK_SET);
+    if (read(cur->fh, &cur->node, sizeof(Node)) != sizeof(Node) ) {
+        error("Cannot read node at %ld\n", cur->nodeoff);
+        return 1;
+    } 
+    log("Loaded node at %d: keyoff=%ld, keysz=%lu, valueoff=%ld, valuesz=%lu, next=%ld\n",
+        cur->idx, cur->node.keyoff, cur->node.keysz,
+        cur->node.valueoff, cur->node.valuesz, cur->node.next);
+    return 0;
+
+}
+@
+
+<<Чтение элемента цепочки>>=
+int _cur_read_chain(Cursor* cur, off_t offset) {
+    cur->prev = cur->chain;
+    cur->prevoff = cur->chainoff;
+    cur->chainoff = offset;
+    lseek(cur->fh, cur->chainoff, SEEK_SET);
+    if( read(cur->fh, &cur->chain, sizeof(Node)) != sizeof(Node) ) {
+        error("Cannot read chain at %ld\n", cur->chainoff);
+        return 1;
+    }
+    cur->len++;
+    log("Loaded node at %d: keyoff=%ld, keysz=%lu, valueoff=%ld, valuesz=%lu, next=%ld\n",
+        cur->idx, cur->chain.keyoff, cur->chain.keysz,
+        cur->chain.valueoff, cur->chain.valuesz, cur->chain.next);
+}
+@
+
+<<Чтение таблицы>>=
+int _cur_read_table(Cursor* cur, off_t offset) {
+    cur->tableoff = offset;
+    lseek(cur->fh, cur->tableoff, SEEK_SET);
+    return read(cur->fh, &cur->th, sizeof(THeader)) != sizeof(THeader);
+}
+@
+     
+<<Низкоуровневое побайтовое сравнение>>=
+int _file_cmp_block(int fh,  const char* key, size_t ks) {
+    char buf[4096];
+    size_t bytes;
+    if ( ks == 0 ) {
+        log("Keys are equal\n");
+        return 1;
+    }
+    bytes = MIN(4096, ks);
+    log("Reading %lu bytes\n", bytes);
+    bytes = read(fh, buf,  MIN(4096, ks));
+    log("Comparing %lu bytes of key blocks '%.4s' and '%.4s'...\n", bytes, buf, key);
+    if ( memcmp(buf, key, MIN(bytes, ks)) == 0 ) {
+        log("Chunks are equal\n");
+        return _file_cmp_block(fh, key+ks, ks-bytes);
+
+    }
+    log("Chunks are not equal\n");
+    return 0;
+}
+@
+
+Соберем все низкоуровневые операции, которым нужен только файл:
+<<Низкоуровневые операции>>=
+<<Низкоуровневое побайтовое сравнение>>
+<<Добавление блока>>
+<<Добавление элемента>>
+<<Добавление таблицы>>
+@
+Доопределим недостающие функции для добавления в конец новых записей.
+<<Добавление блока>>=
+int _file_append_block(int fh, const char* value, off_t* offset, size_t* size) {
+    *size = strlen(value) + 1;
+    *offset = lseek(fh, 0, SEEK_END);
+    //*offset = ftell(fh);
+    return write(fh, value, *size) != *size;
+}
+@
+<<Добавление элемента>>=
+int _file_append_node(int fh, Node* node, off_t* offset) {
+    *offset = lseek(fh, 0, SEEK_END);
+    //*offset = ftell(fh);
+    return write(fh, node, sizeof(Node)) != sizeof(Node);
+}
+@
+<<Добавление таблицы>>=
+int _file_append_table(int fh, size_t capacity, off_t* offset) {
+    THeader th = (THeader){TABLE_MAGIC, capacity, 0, 0, 0};
+    char buf[4096];
+    size_t bytes = capacity*sizeof(Node);
+    int i;
+    memset(buf, 0, sizeof(buf));
+    *offset = lseek(fh, 0, SEEK_END);
+    //*offset = ftell(fh);
+    if (write(fh, &th, sizeof(th)) != sizeof(th)) return -1;
+    for (i = 0; i < bytes/sizeof(buf); i++ ) {
+        if (write(fh, buf, sizeof(buf)) != sizeof(buf)) return -2;
+    }
+    bytes = bytes % sizeof(buf);
+    if ( bytes  > 0) 
+        if (write(fh, buf, bytes) != bytes) return -2;
+    return 0;        
+}
+@
+
+
+
+Пришло время определить высокоуровневые операции, которые, собственно, и образуют интерфейсные функции:
+<<Интерфейсные функции>>=
+<<Открытие файла базы данных>>
+<<Закрытие файла базы данных>>
+<<Установка ассоциации>>
+<<Получение значения по ключу>>
+<<Удаление значения по ключу>>
+<<Получение статистики>>
+@
+
+
+
+Самая интересная операция -- это операция помещения пары ключ-значние в базу. Сделаем это с учетом расширения таблиц.
+
+<<Установка ассоциации>>=
+int ht_set(DB* db, const char* key, const char* value) {
+    Cursor cur;
+    if ( _ht_search(db, &cur, key) )
+        // элемент с нужным ключом найден -- обновляем значение
+        return _cur_set_value(&cur, value);
+    else {
+        // элемент не найден
+        if ( cur.th.nodes*100 >= cur.th.capacity*56) {
+            // создаем новую таблицу, если текущая таблица переполнена
+            error("Inserting table of size %u... when size=%u, nodes=%u, maxlen=%u ", cur.th.capacity*2+1, cur.th.size, cur.th.nodes, cur.th.len);
+            _file_append_table(cur.fh, cur.th.capacity*2+1, &cur.th.next);
+            cur.stat->tables ++;
+            cur.stat->capacity += cur.th.capacity*2+1;
+            _cur_update_stat(&cur);
+            _cur_update_table(&cur);
+            _cur_read_table(&cur, cur.th.next);
+            _cur_search(&cur, key);
+            error("DONE\n");
+        }
+        if ( cur.nodeoff == cur.chainoff && !cur.node.keyoff ) 
+            return _cur_write_node(&cur, key, value);
+        else
+            return _cur_write_chain(&cur, key, value);
+    }
+}
+@
+
+<<Получение значения по ключу>>=
+int ht_get(DB* db, const char* key, char** value) {
+    Cursor cur;
+    if ( _ht_search(db, &cur, key) ) {
+        *value = malloc(cur.chain.valuesz);
+        lseek(cur.fh, cur.chain.valueoff, SEEK_SET);
+        if ( read(cur.fh, *value, cur.chain.valuesz) == cur.chain.valuesz ) {
+            return 1;
+        } else {
+            error("Cannod read %lu bytes for value at %ld\n", cur.chain.valuesz,
+                cur.chain.valueoff);
+            return 0;
+        }
+    }
+    return 0;
+}
+@
+
+<<Удаление значения по ключу>>=
+int ht_del(DB* db, const char* key) {
+    Cursor cur;
+    if ( _ht_search(db, &cur, key) ) {
+        _cur_del_node(&cur);
+        return 1;
+    }
+    return 0;
+}
+@
+
+Открытие Базы данных -- достаточно сложная операция, поскольку сначала нужно удостовериться, если файл существует, то он - наш.
+Для этого мы сначала его открываем в режиме чтения и вызываем функцию [[_file_check_magic]], после проверки -- переоткрываем файл на запись,
+а если файла не существует -- создаем файл и записываем заголовок [[_file_write_header]], и сразу после заголовка добавляем таблицу.
+Как только файл успешно открыт, зачитываем из него статистику.
+<<Открытие файла базы данных>>=
+DB* ht_open(const char* filename, size_t initial_capacity) {
+    DB* dbh;
+    FILE* f = fopen(filename, "r");
+    if ( f ) {
+        if (_file_check_magic(fileno(f))) {
+            f = freopen(NULL, "r+", f);
+        } else {
+            error("Wrong magic file %s\n", filename);
+            return NULL;
+        }
+    } else {
+        off_t first_table_offset;
+        f = fopen(filename, "w+");
+        if ( !f ) {
+            error("Cannot open file %s for writing\n", filename);
+            return NULL;
+        }
+        _file_write_header(fileno(f), initial_capacity);
+        _file_append_table(fileno(f), initial_capacity, &first_table_offset);
+    }
+    if ( !f ) {
+        error("Cannot open file %s\n", filename);
+        return NULL;
+    }
+    dbh = malloc(sizeof(DB));
+    dbh->fh = fileno(f);
+    //dbh->hash = rot1333;
+    dbh->hash = md5hash;
+    dbh->hash2 = rot1333;
+    _file_load_stat(dbh->fh, &dbh->stat);
+    return dbh;
+}
+@
+
+<<Получение статистики>>=
+int ht_get_stat(DB* dbh, Stat* stat) {
+    *stat = dbh->stat;
+    return 0;
+}
+@
+
+Соответственно, мы предполагаем, что в самом объекте БД [[DB]] достаточно хранить указатель на открытый файл, функцию хеширования и статистику:
+<<Определение структуры БД>>=
+struct _DB {
+    int fh;
+    uint64_t (*hash)(const char*);
+    uint64_t (*hash2)(const char*);
+    Stat stat;
+};
+@
+
+<<Закрытие файла базы данных>>=
+int ht_close(DB* db) {
+    if( db ) {
+        if (db->fh) close(db->fh);
+        free(db);
+    }
+    return 0;
+}
+@
+
+
+Доопределим наши низкоуровневые функции 
+<<Низкоуровневые операции>>=
+<<Проверка файла>>
+<<Добавление заголовка>>
+<<Чтение статистики>>
+@
+
+<<Проверка файла>>=
+int _file_check_magic(int fh) {
+    char magic[] = DB_MAGIC;
+    char buf[4];
+    lseek(fh, 0, SEEK_SET);
+    if (read(fh, buf, 4) != 4 ) {
+        error("Cannot read magic\n");
+        return 0;
+    }
+    if ( memcmp(magic, buf, 4) ) {
+        error("Wrong magic\n");
+        return 0;
+    }
+    return 1;
+}
+@
+
+<<Добавление заголовка>>=
+int _file_write_header(int fh, size_t initial_capacity) {
+    Stat stat = {0};
+    stat.capacity = initial_capacity;
+    stat.tables = 1;
+    DHeader dh = (DHeader){DB_MAGIC, CURRENT_VERSION, stat}; 
+    lseek(fh, 0, SEEK_SET);
+    if ( write(fh, &dh, sizeof(dh)) != sizeof(dh) ) return -1;
+    return 0;
+}
+@
+
+<<Чтение статистики>>=
+int _file_load_stat(int fh, Stat* stat) {
+    lseek(fh, offsetof(DHeader, stat), SEEK_SET);
+    return read(fh, stat, sizeof(Stat)) != sizeof(Stat);
+}
+@
+
+А также объединим все операции с курсором.
+<<Операции с курсором>>=
+<<Загрузка элемента таблицы>>
+<<Чтение элемента цепочки>>
+<<Чтение таблицы>>
+<<Запись элемента таблицы>>
+<<Запись элемента цепочки>>
+<<Запись предыдущего элемента>>
+<<Запись таблицы>>
+<<Запись статистики>>
+<<Сравнение ключа>>
+<<Проход по цепочке>>
+<<Поиск элемента>>
+<<Запись в цепочку>>
+<<Запись в таблицу>>
+<<Обновление элемента>>
+<<Удаление элемента>>
+@
+
+Определим послений набор операций с курсором, которые записывают (обновляют) соответствующие поля курсора.
+<<Запись элемента таблицы>>=
+int _cur_update_node(Cursor* cur) {
+    lseek(cur->fh, cur->nodeoff, SEEK_SET);
+    return write(cur->fh, &cur->node, sizeof(Node)) != sizeof(Node);
+
+}
+@
+
+<<Запись предыдущего элемента>>=
+int _cur_update_prev(Cursor* cur) {
+    lseek(cur->fh, cur->prevoff, SEEK_SET);
+    return write(cur->fh, &cur->prev, sizeof(Node)) != sizeof(Node);
+}
+@
+
+<<Запись элемента цепочки>>=
+int _cur_update_chain(Cursor* cur) {
+    lseek(cur->fh, cur->chainoff, SEEK_SET);
+    return write(cur->fh, &cur->chain, sizeof(Node)) != sizeof(Node);
+}
+@
+
+<<Запись таблицы>>=
+int _cur_update_table(Cursor* cur) {
+    if ( cur->len > cur->th.len ) cur->th.len = cur->len;
+    lseek(cur->fh, cur->tableoff, SEEK_SET);
+    return write(cur->fh, &cur->th, sizeof(THeader)) != sizeof(THeader);
+}
+@
+
+<<Запись статистики>>=
+int _cur_update_stat(Cursor* cur) {
+    lseek(cur->fh, offsetof(DHeader, stat), SEEK_SET);
+    return write(cur->fh, cur->stat, sizeof(Stat)) != sizeof(Stat);
+}
+@
+
+
+Все магические последовательности отнесем в [[Константы]]
+<<Константы>>=
+#define DB_MAGIC  {'H', 'T', 'd', 'b'}
+#define TABLE_MAGIC  {'H', 'T', 'T', 'b'}
+#define CURRENT_VERSION 1
+@
+
+Заголовочный файл с интерфейсом
+<<hashdb.h>>=
+#ifndef _HASHDB_H_
+#define _HASHDB_H_
+#include <stdint.h>
+
+typedef struct _DB DB;
+
+
+
+<<Определение структуры статистики>>
+
+DB* ht_open(const char* filename, size_t initial_capacity);
+
+int ht_set(DB* dbh, const char* key, const char* value);
+int ht_get(DB* dbh, const char* key, char** value);
+int ht_del(DB* dbh, const char* key);
+
+int ht_close(DB* dbh);
+
+int ht_get_stat(DB* dbh, Stat* stat);
+
+#endif /* _HASHDB_H_ */
+@
+
+Добавим определение хеш-функции. Возьмем пока простую функию типа rot13, но расширенную до 64 бит
+<<Хеш-функция>>=
+
+static inline uint32_t murmur_32_scramble(uint32_t k) {
+    k *= 0xcc9e2d51;
+    k =   (k >> 17)| (k << 15);
+    k *= 0x1b873593;
+    return k;
+}
+static inline uint32_t murmur3_32(const uint8_t* key, size_t len, uint32_t seed)
+{
+	uint32_t h = seed;
+    uint32_t k;
+    /* Read in groups of 4. */
+    for (size_t i = len >> 2; i; i--) {
+        // Here is a source of differing results across endiannesses.
+        // A swap here has no effects on hash properties though.
+        memcpy(&k, key, sizeof(uint32_t));
+        key += sizeof(uint32_t);
+        h ^= murmur_32_scramble(k);
+        h = (h >> 19) | (h << 13)  ;
+        h = h * 5 + 0xe6546b64;
+    }
+    /* Read the rest. */
+    k = 0;
+    for (size_t i = len & 3; i; i--) {
+        k <<= 8;
+        k |= key[i - 1];
+    }
+    // A swap is *not* necessary here because the preceding loop already
+    // places the low bytes in the low places according to whatever endianness
+    // we use. Swaps only apply when the memory is copied in a chunk.
+    h ^= murmur_32_scramble(k);
+    /* Finalize. */
+	h ^= len;
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h;
+}
+
+static inline uint64_t rot1333(const uint8_t* v) {
+    //return murmur3_32(v, strlen(v), 0x989124f1);
+    uint64_t h = 0xb928c940def2313c;
+    uint8_t p = 241;
+    uint8_t pp = 117;
+    while(*v) {
+        //h = (h >> 31 ) | (h << 33);
+        h += 0xaa4294967291*(17*(*v)*p*pp+31*(*v)*p + 5*(*v)+3*p + pp + 11*(*v)) ; // + 0x55555555555559*(((*v) >> 5) | ((*v) << 3));
+        //h ^= (h <<32);
+        h = (h >> 51) | (h << 13);
+        h *= 128000115967;
+        h = (h >> 45) | (h << 19);
+        h ^= (h >> 31) ^ (h << 33);
+        h = (h >> 49) | (h << 15);
+        h = (h >> 47) | (h << 17);
+        pp = p;
+        p = *v;
+        v++;
+        
+    }
+    return h;
+}
+
+#include <openssl/md5.h>
+
+static inline uint64_t md5hash(const char* v) {
+    unsigned char result[MD5_DIGEST_LENGTH];
+    uint64_t* k = (uint64_t*)result;
+    MD5(v, strlen(v), result);
+    return *k;
+}
+
+
+@
+
+
+<<Определение структуры статистики>>=
+typedef struct _Stat {
+    uint64_t keys;
+    uint16_t tables;
+    uint64_t capacity;
+    uint64_t keysz;
+    uint64_t valuesz;
+    uint16_t maxlen;
+    uint64_t nodes;
+} Stat;
+@
+
+\section{Реализация}
+
+<<hashdb.c>>=
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include "hashdb.h"
+
+
+#define error(str, ...) fprintf(stderr, "[err] " str, ## __VA_ARGS__)
+#define log(str, ...)  {}
+//fprintf(stderr, "[log] " str, ##  __VA_ARGS__)
+#define MIN(a, b) ((a)<(b)? (a) : (b))
+
+<<Константы>>
+
+<<Определение структуры БД>>
+<<Структура заголовка БД>>
+<<Структура заголовка таблицы>>
+<<Структура элемента таблицы>>
+
+
+
+<<Хеш-функция>>
+<<Курсор>>
+
+<<Низкоуровневые операции>>
+<<Операции с курсором>>
+<<Инициализация курсора>>
+<<Интерфейсные функции>>
+@
+
+Компиляция реализации выглядит просто:
+\begin{verbatim}
+gcc -c -O3 -o hashdb.o hashdb.c
+\end{verbatim}
+При этом мы получим библиотеку [[hashdb.o]], которую затем можно будет включать в свои модули.
+
+\section{Тестирование}
+Напишем простую программу для тестирования нашей базы
+<<hashdbtest.c>>=
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "hashdb.h"
+
+int main(int argc, char* argv[]) {
+    DB* dbh;
+    char buf[4096];
+    if (argc < 2) {
+        printf("usage: %s <dbfilename>\n", argv[0]);
+        exit(1);
+    }
+    dbh = ht_open(argv[1], 141307);
+    if ( !dbh ) {
+        printf("Cannot open database %s\n", argv[1]);
+        exit(1);
+    }
+    while(fgets(buf, 4096, stdin)) {
+        char*s = buf;
+        char* cmd = strsep(&s, " \t\n");
+        if ( cmd ) {
+            if (!strcmp(cmd, "SET")) {
+                char* key = strsep(&s, " \t\n");
+                char* val = strsep(&s, "\n");
+                if (key && val) {
+                    printf("Setting '%s' = '%s'\n", key, val);
+                    ht_set(dbh, key, val);
+                    printf("OK\n");
+                } else 
+                    printf("No key or val given\n");
+            } else if ( !strcmp(cmd, "GET")) {
+                char* key = strsep(&s, " \t\n");
+                if ( key ) {
+                    char* val;
+                    if ( ht_get(dbh, key, &val) ) {
+                        printf("%s\n", val);
+                        free(val);
+                    } else {
+                        printf("No such key\n");
+                    }
+                }
+            } else if ( !strcmp(cmd, "DEL")) {
+                char* key = strsep(&s, " \t\n");
+                if ( key ) {
+                    ht_del(dbh, key);
+                    printf("OK\n");
+                }
+            } else if ( !strcmp(cmd, "STAT")) {
+                Stat stat;
+                ht_get_stat(dbh, &stat);
+                printf("Keys: %lu\n tables: %u\nAvg. key size: %f\n"
+                    "Avg. value size: %f\n"
+                    "Total capacity: %lu\n"
+                    "Avg. Fill factor: %f\n"
+                    "Max chain length: %u\n"
+                    "Filled nodes: %lu\n"
+                    "Node fill factor: %f\n"
+                    "Avg chain length: %f\n",
+                    stat.keys, stat.tables,
+                    stat.keysz/(float)stat.keys,
+                    stat.valuesz/(float)stat.keys,
+                    stat.capacity,
+                    stat.keys/(float)stat.capacity,
+                    stat.maxlen,
+                    stat.nodes,
+                    stat.nodes/(float)stat.capacity,
+                    stat.keys/(float)stat.nodes);
+            } else if ( !strcmp(cmd, "MASS")) { 
+                char *start = strsep(&s, " \t\n");
+                char *count = strsep(&s, " \t\n");
+                if (start && count) {
+                    int i;
+                    int st = atoi(start);
+                    int cnt = atoi(count);
+                    printf("Starting set from %d to %d\n", st, st+cnt);
+                    for ( i = st; i<= st+cnt; i++) {
+                        char key[100];
+                        char value[100];
+                        snprintf(key, 100, "key%d", i);
+                        snprintf(value, 100, "value%d", i);
+                        ht_set(dbh, key, value);
+                    }
+                    printf("Done\n");
+                } 
+
+            } else if ( !strcmp(cmd, "QUIT") || !strcmp(cmd, "EXIT")) {
+                break;
+            } else {
+                printf("unknown command\n");
+            }
+        }
+    }
+    ht_close(dbh);
+    return 0;
+}
+@
+
+\section*{Задание}
+\begin{itemize}
+\item Добавить в статистику максимальную длину цепочки.
+\item Протестировать таблицу на скорость добавления нового элемента. Нарисовать график зависимости времени вставки от количества хранимых элементов. Все делать с отключенным отладочным выводом.
+\item ПРи большом количестве ключей посчитать среднее отношение добавочной информации к полезной (Отношение размера таблицы к сумме размеров всех ключей и значений). Нарисовать график от количества элементов и их среднего размера.
+\item проделать все предыдущие задачи с различными хеш-функциями. Выбрать лучшую и доложить.
+\end{itemize}
+
